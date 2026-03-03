@@ -16,7 +16,7 @@ The project pulls historical price, earnings, and profile data from the Financia
 - Visual outputs including bull/bear return charts and model diagnostics.
 - Exportable artifacts: datasets, metrics CSVs, charts, and full PDF reports.
 
-The repo provides both:
+# The repo provides both:
 
 - A CLI script for reproducible, scriptable analysis.
 - A Streamlit app for interactive exploration, model diagnostics, and report download.
