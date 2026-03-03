@@ -8,15 +8,16 @@ The project pulls historical price, earnings, and profile data from the Financia
 
 # Core capabilities include:
 
-Feature engineering from price momentum and volatility windows.
-Earnings surprise features for event-based forecasting.
-Multi-model benchmarking across Linear Regression, Ridge, Lasso, and Random Forest.
-Holdout-based evaluation with MAE, RMSE, and R2 metrics.
-Signal interpretation layer that translates model outputs into direction and strength (bullish/bearish, weak/medium/strong).
-Visual outputs including bull/bear return charts and model diagnostics.
-Exportable artifacts: datasets, metrics CSVs, charts, and full PDF reports.
+- Feature engineering from price momentum and volatility windows.
+- Earnings surprise features for event-based forecasting.
+- Multi-model benchmarking across Linear Regression, Ridge, Lasso, and Random Forest.
+- Holdout-based evaluation with MAE, RMSE, and R2 metrics.
+- Signal interpretation layer that translates model outputs into direction and strength (bullish/bearish, weak/medium/strong).
+- Visual outputs including bull/bear return charts and model diagnostics.
+- Exportable artifacts: datasets, metrics CSVs, charts, and full PDF reports.
+
 The repo provides both:
 
-A CLI script for reproducible, scriptable analysis.
-A Streamlit app for interactive exploration, model diagnostics, and report download.
+- A CLI script for reproducible, scriptable analysis.
+- A Streamlit app for interactive exploration, model diagnostics, and report download.
 This is built for learning and research in financial ML workflows, not for direct trading automation or investment advice.
