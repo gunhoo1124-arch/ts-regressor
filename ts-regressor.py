@@ -32,6 +32,10 @@ SUPPORTED_EXCHANGES = ("NASDAQ", "NYSE")
 
 MODEL_NAMES = ["LinearRegression", "Ridge", "Lasso", "RandomForest"]
 
+SHORT_HORIZON_DAYS = {5, 10, 21}
+MID_HORIZON_DAYS = {63, 126}
+LONG_HORIZON_DAYS = {252}
+
 EARNINGS_FEATURE_COLS = [
     "eps_surprise_pct",
     "rev_surprise_pct",
@@ -55,6 +59,9 @@ WEEKLY_FEATURE_COLS = [
     "pre_20d_vol",
 ]
 
+# Backward-compatible alias used by Streamlit UI.
+PERIODIC_FEATURE_COLS = BIWEEKLY_FEATURE_COLS.copy()
+
 
 def make_model(name: str) -> Any:
     if name == "LinearRegression":
@@ -66,6 +73,101 @@ def make_model(name: str) -> Any:
     if name == "RandomForest":
         return RandomForestRegressor(n_estimators=300, random_state=42)
     raise ValueError(f"Unknown model name: {name}")
+
+
+def _base_periodic_model_pool(period_days: int) -> Tuple[str, List[str]]:
+    if period_days in SHORT_HORIZON_DAYS or period_days <= 21:
+        return "Short-Term", ["LinearRegression", "Ridge", "Lasso", "RandomForest"]
+    if period_days in MID_HORIZON_DAYS or period_days <= 126:
+        return "Medium-Term", ["Ridge", "Lasso", "LinearRegression", "RandomForest"]
+    return "Long-Term", ["Ridge", "LinearRegression", "Lasso"]
+
+
+def _minimum_rows_for_period(period_days: int) -> int:
+    if period_days <= 21:
+        return 20
+    if period_days <= 63:
+        return 10
+    if period_days <= 126:
+        return 8
+    return 6
+
+
+def _full_stack_rows_for_period(period_days: int) -> int:
+    if period_days <= 21:
+        return 40
+    if period_days <= 63:
+        return 16
+    if period_days <= 126:
+        return 12
+    return 10
+
+
+def get_modeling_profile(period_days: Optional[int], sample_size: int) -> Dict[str, Any]:
+    if period_days is None:
+        selected = MODEL_NAMES.copy() if sample_size >= 4 else []
+        note = "" if selected else "Need at least 4 labeled rows for baseline model training."
+        return {
+            "horizon_bucket": "Baseline",
+            "candidate_models": MODEL_NAMES.copy(),
+            "selected_models": selected,
+            "sample_size": int(sample_size),
+            "minimum_rows": 4,
+            "analysis_mode": "ml_forecast" if selected else "trend_only",
+            "ml_available": bool(selected),
+            "gating_note": note,
+        }
+
+    horizon_bucket, candidate_models = _base_periodic_model_pool(int(period_days))
+    min_rows = _minimum_rows_for_period(int(period_days))
+    full_stack_rows = _full_stack_rows_for_period(int(period_days))
+
+    if sample_size < min_rows:
+        note = (
+            f"{period_days}-day ML unavailable: only {sample_size} labeled rows "
+            f"(min {min_rows}). Trend-only mode is active."
+        )
+        return {
+            "horizon_bucket": horizon_bucket,
+            "candidate_models": candidate_models,
+            "selected_models": [],
+            "sample_size": int(sample_size),
+            "minimum_rows": int(min_rows),
+            "full_stack_rows": int(full_stack_rows),
+            "analysis_mode": "trend_only",
+            "ml_available": False,
+            "low_sample": True,
+            "gating_note": note,
+        }
+
+    low_sample = sample_size < full_stack_rows
+    if low_sample:
+        selected_models = ["Ridge", "Lasso"]
+        note = "Low-sample regime: using Ridge + Lasso only."
+    else:
+        selected_models = candidate_models
+        note = "ML forecast mode active with full horizon model stack."
+
+    return {
+        "horizon_bucket": horizon_bucket,
+        "candidate_models": candidate_models,
+        "selected_models": selected_models,
+        "sample_size": int(sample_size),
+        "minimum_rows": int(min_rows),
+        "full_stack_rows": int(full_stack_rows),
+        "analysis_mode": "ml_forecast",
+        "ml_available": True,
+        "low_sample": bool(low_sample),
+        "gating_note": note,
+    }
+
+
+def _safe_ic(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    if y_true.size < 2 or y_pred.size < 2:
+        return np.nan
+    if np.nanstd(y_true) == 0 or np.nanstd(y_pred) == 0:
+        return np.nan
+    return float(np.corrcoef(y_true, y_pred)[0, 1])
 
 
 def _parse_date(value: Any) -> Optional[date]:
@@ -505,37 +607,38 @@ def _evaluate_models(
     show_output: bool = True,
     feature_cols: Optional[List[str]] = None,
     return_models: bool = False,
+    period_days: Optional[int] = None,
 ) -> Any:
     """
     Train/evaluate multiple regressors on the selected return target.
 
     Technical summary:
-    - Features: caller-provided (earnings surprises + timing or biweekly momentum/volatility).
+    - Features: caller-provided (earnings surprises + timing or periodic momentum/volatility).
     - Split: time-ordered 75/25 holdout to simulate forward-looking evaluation (no shuffling).
-    - Models: linear regression, Ridge, Lasso (with standardization), and Random Forest (raw features).
-    - Metrics: MAE, RMSE, and R2 on the holdout set.
+    - Model set: selected by horizon + sample-size gating for reliability.
+    - Metrics: MAE, RMSE, R2, directional accuracy, IC, and a composite score.
     """
-    # ML step 1: feature/target assembly.
-    # We are modeling a real-valued target y (next-period return) from features X.
-    # Formally, we fit a function f: R^p -> R that minimizes a loss on training data.
-    # Feature vector: caller provides columns for earnings or biweekly mode.
     feature_cols = feature_cols or EARNINGS_FEATURE_COLS
 
     model_df = df.dropna(subset=feature_cols + ["target_return"]).copy()
-    if model_df.shape[0] < 4:
-        print("Not enough rows for modeling after feature/target filtering.")
+    sample_size = int(model_df.shape[0])
+    profile = get_modeling_profile(period_days, sample_size)
+    selected_models = profile.get("selected_models", [])
+
+    if sample_size < 4 or not selected_models:
+        if show_output:
+            print("Not enough rows for modeling after feature/target filtering.")
+            note = profile.get("gating_note", "")
+            if note:
+                print(note)
         empty_metrics = pd.DataFrame()
         if return_models:
             return empty_metrics, {}
         return empty_metrics
 
-    # X is the design matrix (n x p); y is the target vector (n).
     X = model_df[feature_cols].to_numpy()
     y = model_df["target_return"].to_numpy()
 
-    # ML step 2: time-ordered split (avoid look-ahead leakage).
-    # We evaluate on later data to approximate forward prediction performance.
-    # Time-ordered split to avoid look-ahead leakage.
     split_idx = max(1, int(len(model_df) * 0.75))
     if split_idx >= len(model_df):
         split_idx = len(model_df) - 1
@@ -543,35 +646,57 @@ def _evaluate_models(
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
 
-    # ML step 3: model definitions.
-    # - LinearRegression solves min_w ||y - Xw||_2^2.
-    # - Ridge solves min_w ||y - Xw||_2^2 + alpha * ||w||_2^2 (L2 regularization).
-    # - Lasso solves min_w ||y - Xw||_2^2 + alpha * ||w||_1 (L1 regularization).
-    # - RandomForest is an ensemble of decision trees; prediction = average of tree outputs.
-    # Linear models are standardized; RandomForest uses raw feature scales.
-    models = [(name, make_model(name)) for name in MODEL_NAMES]
+    models: List[Tuple[str, Any]] = []
+    for name in selected_models:
+        try:
+            models.append((name, make_model(name)))
+        except ValueError:
+            continue
 
-    results = []
+    if not models:
+        empty_metrics = pd.DataFrame()
+        if return_models:
+            return empty_metrics, {}
+        return empty_metrics
+
+    results: List[Dict[str, Any]] = []
     fitted_models: Dict[str, Any] = {}
+
     for name, model in models:
-        # ML step 4: training (fit) and prediction (inference).
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
         fitted_models[name] = model
 
-        # ML step 5: evaluation metrics.
-        # MAE = mean(|y - y_hat|)
-        # RMSE = sqrt(mean((y - y_hat)^2))
-        # R2 = 1 - (SS_res / SS_tot) measures variance explained (higher is better).
-        # MAE/RMSE are in return units; R2 is fit quality on the holdout set.
         mae = mean_absolute_error(y_test, y_pred)
-        mse = mean_squared_error(y_test, y_pred)
-        rmse = float(np.sqrt(mse))
+        rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
         r2 = r2_score(y_test, y_pred) if len(y_test) > 1 else np.nan
+        direction_acc = float(np.mean(np.sign(y_pred) == np.sign(y_test))) if len(y_test) > 0 else np.nan
+        ic = _safe_ic(np.asarray(y_test), np.asarray(y_pred))
 
-        results.append({"model": name, "mae": mae, "rmse": rmse, "r2": r2})
+        results.append(
+            {
+                "model": name,
+                "mae": mae,
+                "rmse": rmse,
+                "r2": r2,
+                "directional_accuracy": direction_acc,
+                "ic": ic,
+                "train_rows": int(len(y_train)),
+                "test_rows": int(len(y_test)),
+            }
+        )
 
     metrics = _metrics_frame(results)
+    if not metrics.empty:
+        rmse_rank = metrics["rmse"].rank(method="dense", ascending=True)
+        mae_rank = metrics["mae"].rank(method="dense", ascending=True)
+        direction_error = 1.0 - metrics["directional_accuracy"].fillna(0.5).clip(0.0, 1.0)
+        direction_rank = direction_error.rank(method="dense", ascending=True)
+
+        metrics["score"] = 0.45 * rmse_rank + 0.35 * mae_rank + 0.20 * direction_rank
+        metrics = metrics.sort_values(["score", "rmse", "mae", "model"]).reset_index(drop=True)
+        metrics.attrs["model_profile"] = profile
+
     if show_output:
         if report_markdown:
             print("\nModel Metrics:")
@@ -592,7 +717,11 @@ def df_to_markdown(df: pd.DataFrame, index: bool = False) -> str:
         return df.to_string(index=index)
 
 
-def describe_signal(predicted_return: float, reference_std: float) -> Tuple[str, str, str]:
+def describe_signal(
+    predicted_return: float,
+    reference_std: float,
+    prediction_dispersion: Optional[float] = None,
+) -> Tuple[str, str, str]:
     direction = "bullish" if predicted_return >= 0 else "bearish"
     magnitude = abs(predicted_return)
     strength: str
@@ -612,7 +741,20 @@ def describe_signal(predicted_return: float, reference_std: float) -> Tuple[str,
         else:
             strength = "strong"
 
+    confidence_note = ""
+    if prediction_dispersion is not None and np.isfinite(prediction_dispersion) and np.isfinite(reference_std):
+        if reference_std > 0:
+            disagreement_ratio = prediction_dispersion / reference_std
+            if disagreement_ratio >= 1.0:
+                strength = "weak"
+                confidence_note = "Model disagreement is high, so confidence is reduced."
+            elif disagreement_ratio >= 0.6 and strength == "strong":
+                strength = "medium"
+                confidence_note = "Model disagreement is moderate, so confidence is tempered."
+
     statement = f"The trend analysis indicates a {strength} {direction} signal."
+    if confidence_note:
+        statement = f"{statement} {confidence_note}"
     return direction, strength, statement
 
 
@@ -621,30 +763,96 @@ def forecast_from_models(
     feature_cols: List[str],
     models: Dict[str, Any],
     metrics: pd.DataFrame,
-) -> Tuple[Optional[float], Optional[str], Optional[pd.Series]]:
+    return_details: bool = False,
+) -> Any:
+    empty_details = {
+        "selected_models": [],
+        "display_name": "n/a",
+        "weights": {},
+        "model_predictions": {},
+        "prediction_dispersion": np.nan,
+        "ensemble_used": False,
+    }
+
     if metrics is None or metrics.empty:
+        if return_details:
+            return None, None, None, empty_details
         return None, None, None
 
-    metrics_sorted = metrics.sort_values("rmse")
-    best_name = metrics_sorted.iloc[0]["model"]
-    best_model = models.get(best_name)
-    if best_model is None:
+    rank_col = "score" if "score" in metrics.columns else "rmse"
+    metrics_sorted = metrics.sort_values(rank_col)
+
+    selected: List[Tuple[str, float]] = []
+    for _, row in metrics_sorted.iterrows():
+        name = str(row.get("model"))
+        if name not in models:
+            continue
+        rmse = float(row.get("rmse", np.nan))
+        if not np.isfinite(rmse):
+            continue
+        selected.append((name, rmse))
+        if len(selected) == 2:
+            break
+
+    if not selected:
+        if return_details:
+            return None, None, None, empty_details
         return None, None, None
 
     train_df = df.dropna(subset=feature_cols + ["target_return"])
     if train_df.empty:
-        return None, None, None
-
-    X_full = train_df[feature_cols].to_numpy()
-    y_full = train_df["target_return"].to_numpy()
-    best_model.fit(X_full, y_full)
+        if return_details:
+            return None, selected[0][0], None, empty_details
+        return None, selected[0][0], None
 
     predict_row = df.dropna(subset=feature_cols).tail(1)
     if predict_row.empty:
-        return None, best_name, None
+        if return_details:
+            return None, selected[0][0], None, empty_details
+        return None, selected[0][0], None
 
-    y_pred = float(best_model.predict(predict_row[feature_cols].to_numpy())[0])
-    return y_pred, best_name, predict_row.iloc[0]
+    X_full = train_df[feature_cols].to_numpy()
+    y_full = train_df["target_return"].to_numpy()
+    X_next = predict_row[feature_cols].to_numpy()
+
+    preds: List[float] = []
+    weights: List[float] = []
+    model_predictions: Dict[str, float] = {}
+
+    for name, rmse in selected:
+        model = models[name]
+        model.fit(X_full, y_full)
+        pred = float(model.predict(X_next)[0])
+        model_predictions[name] = pred
+        preds.append(pred)
+
+        safe_rmse = max(rmse, 1e-8)
+        weights.append(1.0 / safe_rmse)
+
+    weight_sum = float(np.sum(weights))
+    if weight_sum <= 0:
+        y_pred = float(np.mean(preds))
+    else:
+        y_pred = float(np.dot(np.asarray(preds), np.asarray(weights)) / weight_sum)
+
+    primary_name = selected[0][0]
+    if len(selected) == 1:
+        display_name = primary_name
+    else:
+        display_name = f"Ensemble ({selected[0][0]} + {selected[1][0]})"
+
+    details = {
+        "selected_models": [name for name, _ in selected],
+        "display_name": display_name,
+        "weights": {name: float(w) for (name, _), w in zip(selected, weights)},
+        "model_predictions": model_predictions,
+        "prediction_dispersion": float(np.std(preds)) if len(preds) > 1 else 0.0,
+        "ensemble_used": len(selected) > 1,
+    }
+
+    if return_details:
+        return y_pred, primary_name, predict_row.iloc[0], details
+    return y_pred, primary_name, predict_row.iloc[0]
 
 
 def save_bull_bear_plot(
